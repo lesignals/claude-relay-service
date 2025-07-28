@@ -86,6 +86,40 @@ function generateOAuthParams() {
 }
 
 /**
+ * 验证代理配置
+ * @param {object|null} proxyConfig - 代理配置对象
+ * @returns {object} 验证结果 {isValid: boolean, error?: string}
+ */
+function validateProxyConfig(proxyConfig) {
+    if (!proxyConfig) {
+        return { isValid: true };
+    }
+    
+    if (!proxyConfig.type) {
+        return { isValid: false, error: 'Missing proxy type' };
+    }
+    
+    if (!['socks5', 'http', 'https'].includes(proxyConfig.type)) {
+        return { isValid: false, error: `Unsupported proxy type: ${proxyConfig.type}` };
+    }
+    
+    if (!proxyConfig.host) {
+        return { isValid: false, error: 'Missing proxy host' };
+    }
+    
+    if (!proxyConfig.port || isNaN(proxyConfig.port) || proxyConfig.port < 1 || proxyConfig.port > 65535) {
+        return { isValid: false, error: 'Invalid proxy port' };
+    }
+    
+    // 验证认证信息（如果提供）
+    if (proxyConfig.username && !proxyConfig.password) {
+        return { isValid: false, error: 'Username provided but password is missing' };
+    }
+    
+    return { isValid: true };
+}
+
+/**
  * 创建代理agent
  * @param {object|null} proxyConfig - 代理配置对象
  * @returns {object|null} 代理agent或null
@@ -95,32 +129,75 @@ function createProxyAgent(proxyConfig) {
         return null;
     }
 
+    // 验证代理配置
+    const validation = validateProxyConfig(proxyConfig);
+    if (!validation.isValid) {
+        logger.error('❌ Invalid proxy configuration', {
+            error: validation.error,
+            proxyConfig: {
+                type: proxyConfig.type,
+                host: proxyConfig.host,
+                port: proxyConfig.port,
+                hasAuth: !!(proxyConfig.username && proxyConfig.password)
+            }
+        });
+        throw new Error(`Invalid proxy configuration: ${validation.error}`);
+    }
+
     try {
         if (proxyConfig.type === 'socks5') {
             const auth = proxyConfig.username && proxyConfig.password ? `${proxyConfig.username}:${proxyConfig.password}@` : '';
             const socksUrl = `socks5://${auth}${proxyConfig.host}:${proxyConfig.port}`;
+            logger.debug('🔗 Creating SOCKS5 proxy agent', {
+                host: proxyConfig.host,
+                port: proxyConfig.port,
+                hasAuth: !!auth
+            });
             return new SocksProxyAgent(socksUrl);
         } else if (proxyConfig.type === 'http' || proxyConfig.type === 'https') {
             const auth = proxyConfig.username && proxyConfig.password ? `${proxyConfig.username}:${proxyConfig.password}@` : '';
             const httpUrl = `${proxyConfig.type}://${auth}${proxyConfig.host}:${proxyConfig.port}`;
+            logger.debug(`🔗 Creating ${proxyConfig.type.toUpperCase()} proxy agent`, {
+                host: proxyConfig.host,
+                port: proxyConfig.port,
+                hasAuth: !!auth
+            });
             return new HttpsProxyAgent(httpUrl);
         }
     } catch (error) {
-        console.warn('⚠️ Invalid proxy configuration:', error);
+        logger.error('❌ Failed to create proxy agent', {
+            error: error.message,
+            proxyConfig: {
+                type: proxyConfig.type,
+                host: proxyConfig.host,
+                port: proxyConfig.port
+            }
+        });
+        throw new Error(`Failed to create proxy agent: ${error.message}`);
     }
 
     return null;
 }
 
 /**
- * 使用授权码交换访问令牌
+ * 等待指定时间
+ * @param {number} ms - 等待时间（毫秒）
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 使用授权码交换访问令牌（带重试机制）
  * @param {string} authorizationCode - 授权码
  * @param {string} codeVerifier - PKCE code verifier
  * @param {string} state - state 参数
  * @param {object|null} proxyConfig - 代理配置（可选）
+ * @param {number} maxRetries - 最大重试次数（默认3次）
  * @returns {Promise<object>} Claude格式的token响应
  */
-async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, proxyConfig = null) {
+async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, proxyConfig = null, maxRetries = 3) {
     // 清理授权码，移除URL片段
     const cleanedCode = authorizationCode.split('#')[0]?.split('&')[0] ?? authorizationCode;
     
@@ -133,62 +210,111 @@ async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, pro
         state: state
     };
 
-    // 创建代理agent
-    const agent = createProxyAgent(proxyConfig);
+    let lastError = null;
+    
+    // 重试逻辑
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        // 创建代理agent（每次重试都重新创建，避免连接状态问题）
+        const agent = createProxyAgent(proxyConfig);
 
-    try {
-        logger.debug('🔄 Attempting OAuth token exchange', {
-            url: OAUTH_CONFIG.TOKEN_URL,
-            codeLength: cleanedCode.length,
-            codePrefix: cleanedCode.substring(0, 10) + '...',
-            hasProxy: !!proxyConfig,
-            proxyType: proxyConfig?.type || 'none'
-        });
+        try {
+            logger.debug(`🔄 OAuth token exchange attempt ${attempt}/${maxRetries}`, {
+                url: OAUTH_CONFIG.TOKEN_URL,
+                codeLength: cleanedCode.length,
+                codePrefix: cleanedCode.substring(0, 10) + '...',
+                hasProxy: !!proxyConfig,
+                proxyType: proxyConfig?.type || 'none',
+                attempt: attempt
+            });
 
-        const response = await axios.post(OAUTH_CONFIG.TOKEN_URL, params, {
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': 'claude-cli/1.0.56 (external, cli)',
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://claude.ai/',
-                'Origin': 'https://claude.ai'
-            },
-            httpsAgent: agent,
-            timeout: 30000
-        });
+            const response = await axios.post(OAUTH_CONFIG.TOKEN_URL, params, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://claude.ai/',
+                    'Origin': 'https://claude.ai'
+                },
+                httpsAgent: agent,
+                timeout: 30000
+            });
 
-        logger.success('✅ OAuth token exchange successful', {
-            status: response.status,
-            hasAccessToken: !!response.data?.access_token,
-            hasRefreshToken: !!response.data?.refresh_token,
-            scopes: response.data?.scope
-        });
+            logger.success('✅ OAuth token exchange successful', {
+                status: response.status,
+                hasAccessToken: !!response.data?.access_token,
+                hasRefreshToken: !!response.data?.refresh_token,
+                scopes: response.data?.scope,
+                attempt: attempt
+            });
 
-        const data = response.data;
-        
-        // 返回Claude格式的token数据
-        return {
-            accessToken: data.access_token,
-            refreshToken: data.refresh_token,
-            expiresAt: (Math.floor(Date.now() / 1000) + data.expires_in) * 1000,
-            scopes: data.scope ? data.scope.split(' ') : ['user:inference', 'user:profile'],
-            isMax: true
-        };
-    } catch (error) {
-        // 处理axios错误响应
-        if (error.response) {
-            // 服务器返回了错误状态码
-            const status = error.response.status;
-            const errorData = error.response.data;
+            const data = response.data;
             
-            logger.error('❌ OAuth token exchange failed with server error', {
+            // 返回Claude格式的token数据
+            return {
+                accessToken: data.access_token,
+                refreshToken: data.refresh_token,
+                expiresAt: (Math.floor(Date.now() / 1000) + data.expires_in) * 1000,
+                scopes: data.scope ? data.scope.split(' ') : ['user:inference', 'user:profile'],
+                isMax: true
+            };
+        } catch (error) {
+            lastError = error;
+            
+            // 对于某些错误类型，不进行重试
+            const shouldNotRetry = error.response && (
+                error.response.status === 400 || // 无效请求参数
+                error.response.status === 401 || // 认证失败
+                error.response.status === 403    // 权限不足
+            );
+            
+            if (shouldNotRetry) {
+                logger.error('❌ OAuth token exchange failed with non-retryable error', {
+                    status: error.response?.status,
+                    statusText: error.response?.statusText,
+                    attempt: attempt
+                });
+                break; // 退出重试循环
+            }
+            
+            // 记录重试信息
+            const isNetworkError = !error.response;
+            const errorType = isNetworkError ? 'network' : 'server';
+            
+            logger.warn(`⚠️ OAuth token exchange attempt ${attempt} failed (${errorType} error)`, {
+                message: error.message,
+                code: error.code,
+                status: error.response?.status,
+                hasProxy: !!proxyConfig,
+                willRetry: attempt < maxRetries
+            });
+            
+            // 如果不是最后一次尝试，等待后重试
+            if (attempt < maxRetries) {
+                const waitTime = Math.min(1000 * Math.pow(2, attempt - 1), 5000); // 指数退避，最多5秒
+                logger.debug(`⏳ Waiting ${waitTime}ms before retry...`);
+                await sleep(waitTime);
+                continue; // 继续下一次尝试
+            }
+        }
+    }
+    
+    // 所有重试都失败了，抛出最后一个错误
+    if (lastError) {
+        // 处理axios错误响应
+        if (lastError.response) {
+            // 服务器返回了错误状态码
+            const status = lastError.response.status;
+            const errorData = lastError.response.data;
+            
+            logger.error('❌ OAuth token exchange failed with server error (after retries)', {
                 status: status,
-                statusText: error.response.statusText,
-                headers: error.response.headers,
+                statusText: lastError.response.statusText,
+                headers: lastError.response.headers,
                 data: errorData,
                 codeLength: cleanedCode.length,
-                codePrefix: cleanedCode.substring(0, 10) + '...'
+                codePrefix: cleanedCode.substring(0, 10) + '...',
+                totalAttempts: maxRetries
             });
             
             // 尝试从错误响应中提取有用信息
@@ -207,24 +333,29 @@ async function exchangeCodeForTokens(authorizationCode, codeVerifier, state, pro
                 }
             }
             
-            throw new Error(`Token exchange failed: ${errorMessage}`);
-        } else if (error.request) {
+            throw new Error(`Token exchange failed after ${maxRetries} attempts: ${errorMessage}`);
+        } else if (lastError.request) {
             // 请求被发送但没有收到响应
-            logger.error('❌ OAuth token exchange failed with network error', {
-                message: error.message,
-                code: error.code,
-                hasProxy: !!proxyConfig
+            logger.error('❌ OAuth token exchange failed with network error (after retries)', {
+                message: lastError.message,
+                code: lastError.code,
+                hasProxy: !!proxyConfig,
+                totalAttempts: maxRetries
             });
-            throw new Error('Token exchange failed: No response from server (network error or timeout)');
+            throw new Error(`Token exchange failed after ${maxRetries} attempts: No response from server (network error or timeout)`);
         } else {
             // 其他错误
-            logger.error('❌ OAuth token exchange failed with unknown error', {
-                message: error.message,
-                stack: error.stack
+            logger.error('❌ OAuth token exchange failed with unknown error (after retries)', {
+                message: lastError.message,
+                stack: lastError.stack,
+                totalAttempts: maxRetries
             });
-            throw new Error(`Token exchange failed: ${error.message}`);
+            throw new Error(`Token exchange failed after ${maxRetries} attempts: ${lastError.message}`);
         }
     }
+    
+    // 这种情况理论上不应该发生，但为了安全起见
+    throw new Error(`Token exchange failed after ${maxRetries} attempts: Unknown error`);
 }
 
 /**
